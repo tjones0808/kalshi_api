@@ -4,7 +4,7 @@ This document explains the service for the person who runs it and the AI agents 
 
 ## 1. What it is
 
-`kalshi-sports-api` is a read-only proxy over the Kalshi Trade API v2, limited to NBA and NFL markets. It reshapes Kalshi data (games, markets, quotes, live scores) so an agent can research and price parlays. It is exposed two ways: a REST API under `/v1` and an MCP server at `/mcp` (Streamable HTTP). Every route except `GET /health` requires an API key. The market data needs no Kalshi account. If you give the service Kalshi API credentials (section 13), it also signs its Kalshi requests and exposes read-only portfolio endpoints (balance, positions, fills, orders, settlements). The service never places, amends, or cancels orders.
+`kalshi-sports-api` is a read-only proxy over the Kalshi Trade API v2, limited to NBA and NFL markets. It reshapes Kalshi data (games, markets, quotes, live scores) so an agent can research and price parlays. It is exposed two ways: a REST API under `/v1` and an MCP server at `/mcp` (Streamable HTTP). Every route except `GET /health` requires an API key (or an OAuth access token, plus the public OAuth routes themselves, when OAuth is enabled for ChatGPT, section 4). The market data needs no Kalshi account. If you give the service Kalshi API credentials (section 13), it also signs its Kalshi requests and exposes read-only portfolio endpoints (balance, positions, fills, orders, settlements). The service never places, amends, or cancels orders.
 
 ## 2. Architecture
 
@@ -47,13 +47,14 @@ flowchart TD
 2. `trust proxy` is set to `1`, so the client IP comes from one proxy hop (Railway).
 3. `GET`/`HEAD /health` answers `{ "status": "ok", "service": "kalshi-sports-api" }` with no auth.
 4. The anonymous IP limiter runs.
-5. `requireApiKey` checks the bearer token.
-6. The per-key limiter runs.
-7. `express.json({ limit: '32kb' })` parses JSON bodies. This runs after auth, so unauthenticated callers never reach the parser and get `401` even with a malformed body. Oversized or malformed bodies from authenticated callers are rejected with their own 4xx.
-8. `GET /v1/_auth-check` returns `{ "ok": true }`. It exists to test auth.
-9. The `/v1/portfolio` router, then the rest of the `/v1` router, and the `/mcp` handler (`app.all`, so any method) are mounted. The portfolio router is mounted first so its gate runs before anything else under `/v1/portfolio`.
-10. A JSON `404 not_found` handler catches unmatched routes.
-11. The error handler maps every thrown error to a safe JSON body.
+5. With OAuth on, the OAuth router answers its public routes (metadata, `/oauth/*`). Without OAuth this step does not exist.
+6. `requireApiKey` checks the bearer token: a static API key, or with OAuth on, an OAuth access token.
+7. The per-key limiter runs.
+8. `express.json({ limit: '32kb' })` parses JSON bodies. This runs after auth, so unauthenticated callers never reach the parser and get `401` even with a malformed body. Oversized or malformed bodies from authenticated callers are rejected with their own 4xx.
+9. `GET /v1/_auth-check` returns `{ "ok": true }`. It exists to test auth.
+10. The `/v1/portfolio` router, then the rest of the `/v1` router, and the `/mcp` handler (`app.all`, so any method) are mounted. The portfolio router is mounted first so its gate runs before anything else under `/v1/portfolio`.
+11. A JSON `404 not_found` handler catches unmatched routes.
+12. The error handler maps every thrown error to a safe JSON body.
 
 Because auth runs before the 404 handler, an unauthenticated request to an unknown path gets `401`, not `404`.
 
@@ -85,6 +86,74 @@ To rotate a key without downtime:
 3. Remove the old key from `API_KEYS` and deploy again.
 
 Keys are read once at startup, so any change needs a restart or redeploy. Per-key counters are keyed by position, so reordering keys moves their counters.
+
+### OAuth sign-in (ChatGPT connectors)
+
+ChatGPT custom MCP connectors require OAuth and cannot send a static key. When `OAUTH_TOKEN_SECRET` and a base URL (`PUBLIC_BASE_URL`, or `https://` plus Railway's `RAILWAY_PUBLIC_DOMAIN`) are both set, the service also acts as an OAuth 2.1 authorization server for itself. Otherwise none of it is mounted and the behavior above is unchanged. The code is in `src/oauth/`. The design follows OpenAI's [Apps SDK authentication guide](https://developers.openai.com/apps-sdk/build/auth) and the MCP [authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
+
+**Endpoints** (public, mounted after the anonymous limiter and before the key check, so they share the per-IP bucket):
+
+| Path | Purpose |
+| --- | --- |
+| `GET /.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata: `resource` is `<base>/mcp`, the authorization server is `<base>`, scope `kalshi.read` |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: S256 PKCE only, public clients (`none`), DCR and Client ID Metadata Documents, `authorization_response_iss_parameter_supported: true` |
+| `POST /oauth/register` | RFC 7591 dynamic client registration, JSON |
+| `GET`/`POST /oauth/authorize` | Validates the request and shows the consent page; the POST checks the API key and redirects with a code |
+| `POST /oauth/token` | `authorization_code` (with PKCE) and `refresh_token` grants, form-encoded |
+
+**Stateless tokens.** There is no database, so a Railway redeploy does not sign anyone out. Every token is `v1.<base64url JSON>.<base64url HMAC-SHA256>`, signed with `OAUTH_TOKEN_SECRET` and compared in constant time. Each carries a `typ` claim and is parsed against that type's schema, so a refresh token, code, consent request, or client id can never pass as an access token:
+
+| `typ` | Lifetime | Holds |
+| --- | --- | --- |
+| `client` | none | Registered redirect URIs and name (the DCR `client_id` itself) |
+| `authreq` | 10 min | The validated authorization request, carried through the consent form so it cannot be altered |
+| `code` | 10 min | Client, redirect URI, PKCE challenge, resource, scope, key fingerprint, one-time id |
+| `access` | 1 hour | `iss` = base, `aud` = `<base>/mcp`, client, scope, key fingerprint |
+| `refresh` | 30 days | Same binding as access; a new one is issued on every refresh |
+
+Each refresh token also carries a token id (`jti`) and a family id (`fam`) created at the code exchange; access tokens carry `fam` too. Refreshing marks the presented `jti` used and issues a new pair in the same family. Presenting a `jti` that was already used is treated as theft: the request gets `invalid_grant` and the whole family is revoked for 30 days, so every refresh and access token that descends from that code stops working.
+
+Tokens are tied to an API key by a fingerprint: the first 32 hex characters (128 bits) of an HMAC of the key under the token secret. On every request the fingerprint is looked up in the current `API_KEYS`. A token resolves to that key's current index, so rate limits and `PORTFOLIO_API_KEYS` gating work exactly as for a bearer key, reordering keys is safe, and removing or rotating a key revokes all of its tokens at once. Changing `OAUTH_TOKEN_SECRET` revokes every token and registered client.
+
+**Resource server.** `requireApiKey` accepts a static key or an access token whose `iss` and `aud` match (`aud` must be `<base>/mcp`). The anonymous limiter treats a valid access token like a valid key. When OAuth is on, every `401` carries `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource", scope="kalshi.read"`, and a rejected token adds `error="invalid_token"`.
+
+**Registration.** ChatGPT can register by DCR or by Client ID Metadata Document (an https `client_id` URL, `https://chatgpt.com/oauth/client.json` per OpenAI's docs). A DCR `client_id` is itself a signed blob of the redirect URIs and name, so nothing is stored. A CIMD URL is fetched only if its host is in `OAUTH_CIMD_HOSTS` (default `chatgpt.com`, separate from the redirect hosts) and is a DNS name, with https, a path, and no port or credentials. The fetch resolves every address of the host and refuses the connection if any is loopback, private, link-local (including the cloud metadata address), carrier-grade NAT, multicast, reserved, or an IPv6 form that embeds an IPv4 address. The socket then connects to an address that was checked (`src/oauth/oauth-fetch.ts`), so a second DNS answer cannot redirect it. Redirects are not followed, the fetch times out after 5 s, the body is capped at 16 KiB, and the result is cached for 1 hour. The document's `client_id` must equal the URL. Redirect URIs must be https on an allowed host (or http on `localhost`/`127.0.0.1`) and are compared exactly at `/oauth/authorize`.
+
+**Consent.** The page names the client and the host it will return to and asks for an API key. The form carries the signed `authreq` blob. The POST needs `decision=approve` (or `deny`), then uses the same constant-time key check as bearer auth; a wrong key re-renders the page with `401` and a generic message. A separate limiter allows 10 failed attempts per IP per window on this route (approvals and denials do not count), on top of the anonymous limiter. The page's CSP is `default-src 'none'`, styles pinned by hash, `frame-ancestors 'none'`, and `form-action 'self'` plus the redirect origin, because Chromium also applies `form-action` to the redirect that follows the POST. A successful response redirects to the client with `code`, `state`, and `iss` (RFC 9207), which ChatGPT uses to select its stable redirect URI.
+
+```mermaid
+sequenceDiagram
+	participant C as ChatGPT
+	participant U as User browser
+	participant S as kalshi-sports-api
+
+	C->>S: POST /mcp (no token)
+	S-->>C: 401 WWW-Authenticate: Bearer resource_metadata=...
+	C->>S: GET /.well-known/oauth-protected-resource
+	S-->>C: resource = base/mcp, authorization_servers = [base]
+	C->>S: GET /.well-known/oauth-authorization-server
+	S-->>C: endpoints, S256, DCR and CIMD support
+	alt Client ID Metadata Document
+		Note over C,S: client_id is an https URL, fetched and cached by S
+	else Dynamic registration
+		C->>S: POST /oauth/register
+		S-->>C: signed client_id
+	end
+	C->>U: open /oauth/authorize?code_challenge&resource&state
+	U->>S: GET /oauth/authorize
+	S-->>U: consent page (signed request blob)
+	U->>S: POST /oauth/authorize (API key, blob)
+	S-->>U: 302 redirect_uri?code&state&iss
+	U->>C: callback with code
+	C->>S: POST /oauth/token (code, code_verifier, resource)
+	S-->>C: access token (1 h) and refresh token (30 d)
+	C->>S: POST /mcp with Bearer access token
+	S-->>C: tools/list, tools/call results
+	C->>S: POST /oauth/token (refresh_token) when the access token expires
+	S-->>C: new access and refresh tokens
+```
+
+**Single instance only.** Three bounded in-memory sets back the replay protections: used code ids (single-use codes), used refresh token ids, and revoked families. The check and the reservation are one synchronous step, so of two concurrent redemptions of the same code or refresh token exactly one wins. A full set first drops expired entries, then the oldest. The state is per process: a restart forgets it, so within a code's 10-minute life it could be redeemed once more by someone holding both the code and the PKCE verifier, and a revoked family works again until its tokens expire. More than one replica would each hold separate state and let a replayed code or refresh token through on another replica. Keep Railway at 1 replica (`railway.json` pins `numReplicas` to 1) and do not scale out without a shared store. Registered clients never expire. The consent page accepts any API key, so approving as a key with portfolio access gives the connector portfolio tools. No token, code, key, or secret is logged.
 
 ## 5. How Kalshi data maps to games
 
@@ -306,6 +375,10 @@ Set through environment variables. A `.env` file is loaded if present. Blank val
 | `KALSHI_PRIVATE_KEY` | none | Kalshi private key as a multiline PEM, a PEM with literal `\n` escapes, or base64 of the PEM. RSA or Ed25519, no passphrase. Not allowed together with `KALSHI_PRIVATE_KEY_PATH` |
 | `KALSHI_PRIVATE_KEY_PATH` | none | Path to a PEM file, read once at startup. Alternative to `KALSHI_PRIVATE_KEY` |
 | `PORTFOLIO_API_KEYS` | none (all `API_KEYS`) | Comma-separated subset of `API_KEYS` allowed to read the portfolio, each at least 32 characters |
+| `OAUTH_TOKEN_SECRET` | none (OAuth off) | At least 32 characters, not containing `replace-me`. OAuth needs this and a base URL |
+| `PUBLIC_BASE_URL` | `https://$RAILWAY_PUBLIC_DOMAIN` | Origin only (no path, query, or credentials), `https` unless `localhost` or `127.0.0.1`. The OAuth issuer |
+| `OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` | Bare host names. A value replaces the default. Governs redirect URIs only |
+| `OAUTH_CIMD_HOSTS` | `chatgpt.com` | Bare host names a client metadata document may be fetched from. Independent of the redirect hosts |
 | `KALSHI_TIMEOUT_MS` | `8000` | 1000 to 60000 |
 | `KALSHI_DEADLINE_MS` | `20000` | 2000 to 120000 |
 | `CACHE_MAX_ENTRIES` | `5000` | 100 to 100000 |
@@ -330,6 +403,8 @@ To deploy:
 2. Set `API_KEYS` in the service variables. Never commit keys. Other variables are optional. For portfolio access also set the Kalshi variables (section 13).
 3. Railway provides `PORT`. The server binds `0.0.0.0`.
 4. Generate a public domain. REST lives at `https://<domain>/v1/...` and MCP at `https://<domain>/mcp`.
+5. Keep the service at 1 replica: the cache, the rate limiters, and the OAuth replay and revocation state are in memory (sections 4 and 14).
+6. For the ChatGPT connector, add `OAUTH_TOKEN_SECRET`. `PUBLIC_BASE_URL` is only needed for a custom domain, because Railway's `RAILWAY_PUBLIC_DOMAIN` is used otherwise.
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and exits once they close, forcing exit after 10 seconds.
 
@@ -377,6 +452,7 @@ On macOS use `base64 -i kalshi.pem | tr -d '\n'`. Redeploy after changing variab
 - No trading or order placement. Account access is read-only and only when Kalshi credentials are set.
 - Portfolio data covers what Kalshi keeps in its live data set. Older fills, orders, and settled positions are in Kalshi's historical endpoints, which this service does not call.
 - No Kalshi native combos (multivariate collections). A parlay here is a calculation, not a contract you can buy as one.
+- OAuth tokens are stateless, but code replay and refresh reuse detection live in memory: single instance only, and a restart forgets them (section 4). Authorization is by API key only; there are no per-user accounts and one scope, `kalshi.read`.
 - The cache and both rate limiters are in memory in a single process. Running several replicas gives each its own cache and its own counters, so limits are not shared.
 - Parlay math assumes the legs are independent. Correlated legs are flagged, not corrected. Odds include the spread and are not vig-free.
 - Classification is heuristic and based on series names. A new or oddly named series may land in `other`.

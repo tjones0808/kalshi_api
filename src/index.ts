@@ -22,6 +22,14 @@ function authStatusLine (keyId: string | undefined): string {
 	return `kalshi auth: enabled (key ${maskKeyId(keyId)})`
 }
 
+/** Startup line saying whether OAuth sign-in is on. */
+function oauthStatusLine (baseUrl: string | undefined): string {
+	if (baseUrl === undefined) {
+		return 'oauth: disabled (API keys only)'
+	}
+	return `oauth: enabled (issuer ${baseUrl})`
+}
+
 function describeError (err: unknown): string {
 	if (err instanceof KalshiHttpError) {
 		return `${err.name} status=${err.status} path=${err.path}`
@@ -62,6 +70,7 @@ function main (): void {
 			: { portfolio: createPortfolioService(raw) }),
 	})
 	console.log(authStatusLine(env.kalshiAuth?.keyId))
+	console.log(oauthStatusLine(env.oauth?.baseUrl))
 	const server = app.listen(env.port, '0.0.0.0', function () {
 		console.log(`listening on 0.0.0.0:${env.port}`)
 	})

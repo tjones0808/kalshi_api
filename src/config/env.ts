@@ -110,6 +110,21 @@ export interface KalshiAuthConfig {
 	privateKey: KeyObject
 }
 
+/** Settings for the built-in OAuth authorization server. */
+export interface OAuthConfig {
+	/** HMAC secret that signs every OAuth token. */
+	tokenSecret: string
+	/** Public origin, no trailing slash. Also the issuer. */
+	baseUrl: string
+	/** Lowercase hosts a client redirect URI may point to. */
+	allowedRedirectHosts: string[]
+	/**
+	 * Lowercase hosts a client metadata document may be fetched
+	 * from. Separate from the redirect hosts on purpose.
+	 */
+	cimdHosts: string[]
+}
+
 export interface AppEnv {
 	port: number
 	apiKeys: string[]
@@ -118,6 +133,11 @@ export interface AppEnv {
 	 * or `null` when every API key may.
 	 */
 	portfolioApiKeys: string[] | null
+	/**
+	 * `null` when OAuth is off: it needs `OAUTH_TOKEN_SECRET`
+	 * and a public base URL.
+	 */
+	oauth: OAuthConfig | null
 	/** `null` when no Kalshi credentials are configured. */
 	kalshiAuth: KalshiAuthConfig | null
 	kalshiBaseUrl: string
@@ -233,12 +253,148 @@ function parsePortfolioKeys (
 	return keys
 }
 
+const minOAuthSecretLength = 32
+const defaultRedirectHosts = [
+	'chatgpt.com',
+	'localhost',
+	'127.0.0.1',
+]
+const defaultCimdHosts = ['chatgpt.com']
+const hostPattern =
+	/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[0-9a-f:]+\])$/
+const loopbackHosts = ['localhost', '127.0.0.1']
+
+function normalizeBaseUrl (raw: string, name: string): string {
+	let url: URL
+	try {
+		url = new URL(raw)
+	} catch {
+		throw new Error(`${name} is not a valid URL.`)
+	}
+	const isLoopback = loopbackHosts.includes(url.hostname)
+	const isSecure = url.protocol === 'https:'
+		|| (url.protocol === 'http:' && isLoopback)
+	if (!isSecure) {
+		throw new Error(
+			`${name} must use https unless the host is `
+			+ 'localhost or 127.0.0.1.',
+		)
+	}
+	const isOrigin = url.pathname === '/'
+		&& url.search === ''
+		&& url.hash === ''
+		&& url.username === ''
+		&& url.password === ''
+	if (!isOrigin) {
+		throw new Error(
+			`${name} must be an origin only: no path, query, `
+			+ 'fragment, or credentials.',
+		)
+	}
+	return url.origin
+}
+
+/**
+ * `PUBLIC_BASE_URL`, else `https://` plus the
+ * `RAILWAY_PUBLIC_DOMAIN` that Railway provides.
+ */
+function resolveBaseUrl (
+	processEnv: NodeJS.ProcessEnv,
+): string | undefined {
+	const explicit = readOptional(processEnv, 'PUBLIC_BASE_URL')
+	if (explicit !== undefined) {
+		return normalizeBaseUrl(explicit.trim(), 'PUBLIC_BASE_URL')
+	}
+	const domain = readOptional(
+		processEnv,
+		'RAILWAY_PUBLIC_DOMAIN',
+	)
+	if (domain === undefined) {
+		return undefined
+	}
+	return normalizeBaseUrl(
+		`https://${domain.trim()}`,
+		'RAILWAY_PUBLIC_DOMAIN',
+	)
+}
+
+function parseHostList (
+	processEnv: NodeJS.ProcessEnv,
+	name: string,
+	defaults: readonly string[],
+): string[] {
+	const raw = readOptional(processEnv, name)
+	if (raw === undefined) {
+		return [...defaults]
+	}
+	const hosts = splitApiKeys(raw.toLowerCase())
+	const isValid = hosts.length > 0 && hosts.every(
+		function (host) {
+			return hostPattern.test(host)
+		},
+	)
+	if (!isValid) {
+		throw new Error(
+			`${name} must list bare host names separated by `
+			+ 'commas, such as chatgpt.com.',
+		)
+	}
+	return [...new Set(hosts)]
+}
+
+/**
+ * OAuth is on only with both `OAUTH_TOKEN_SECRET` and a base
+ * URL. A secret that is set but too short or a placeholder is
+ * an error, so a typo never silently weakens token signing.
+ * Messages never include the secret.
+ */
+function parseOAuthConfig (
+	processEnv: NodeJS.ProcessEnv,
+): OAuthConfig | null {
+	const raw = readOptional(processEnv, 'OAUTH_TOKEN_SECRET')
+	if (raw === undefined) {
+		return null
+	}
+	const tokenSecret = raw.trim()
+	if (tokenSecret.length < minOAuthSecretLength) {
+		throw new Error(
+			'OAUTH_TOKEN_SECRET must be at least 32 characters.',
+		)
+	}
+	if (tokenSecret.toLowerCase().includes(placeholderMarker)) {
+		throw new Error(
+			'OAUTH_TOKEN_SECRET contains the placeholder from '
+			+ '.env.example. Generate a real secret as shown in '
+			+ 'the README.',
+		)
+	}
+	const baseUrl = resolveBaseUrl(processEnv)
+	if (baseUrl === undefined) {
+		return null
+	}
+	return {
+		tokenSecret,
+		baseUrl,
+		allowedRedirectHosts: parseHostList(
+			processEnv,
+			'OAUTH_ALLOWED_REDIRECT_HOSTS',
+			defaultRedirectHosts,
+		),
+		cimdHosts: parseHostList(
+			processEnv,
+			'OAUTH_CIMD_HOSTS',
+			defaultCimdHosts,
+		),
+	}
+}
+
 /**
  * Parse a process environment into typed application config.
  * Throws when `API_KEYS` is missing, empty, holds the
  * `.env.example` placeholder, or any key is shorter than
  * 32 characters. Also throws on a partial or unreadable Kalshi
- * credential setup and on an invalid `PORTFOLIO_API_KEYS`;
+ * credential setup, on an invalid `PORTFOLIO_API_KEYS`, and on
+ * an invalid OAuth secret, base URL, or redirect host list;
  * those messages never include key material.
  */
 export function parseEnv (
@@ -282,6 +438,7 @@ export function parseEnv (
 			processEnv,
 			data.API_KEYS,
 		),
+		oauth: parseOAuthConfig(processEnv),
 		kalshiAuth: parseKalshiAuth(processEnv),
 		kalshiBaseUrl: data.KALSHI_BASE_URL,
 		kalshiTimeoutMs: data.KALSHI_TIMEOUT_MS,

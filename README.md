@@ -46,6 +46,10 @@ All variables are optional except `API_KEYS`.
 | `KALSHI_PRIVATE_KEY` | unset | Kalshi private key (RSA or Ed25519): multiline PEM, PEM with literal `\n` escapes, or base64 of the PEM. Not with `KALSHI_PRIVATE_KEY_PATH` |
 | `KALSHI_PRIVATE_KEY_PATH` | unset | Path to a PEM file, read at startup. Alternative to `KALSHI_PRIVATE_KEY` |
 | `PORTFOLIO_API_KEYS` | unset | Comma-separated subset of `API_KEYS` (32+ chars each) allowed to read the portfolio. Unset means every API key may |
+| `OAUTH_TOKEN_SECRET` | unset | 32+ chars, not `replace-me`. Signs OAuth tokens. OAuth turns on only when this and a base URL are set. See [ChatGPT connector](#chatgpt-connector-oauth) |
+| `PUBLIC_BASE_URL` | `https://$RAILWAY_PUBLIC_DOMAIN` | Public origin used as the OAuth issuer, no path. Must be `https` unless the host is `localhost` or `127.0.0.1` |
+| `OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` | Comma-separated hosts an OAuth client may redirect to. A list you set replaces the default |
+| `OAUTH_CIMD_HOSTS` | `chatgpt.com` | Hosts a client metadata document may be fetched from. Separate from the redirect hosts |
 | `KALSHI_TIMEOUT_MS` | `8000` | Per-attempt Kalshi timeout, 1000-60000. Timed-out attempts retry; if all fail, the API returns `504 upstream_timeout` |
 | `KALSHI_DEADLINE_MS` | `20000` | Overall budget for one Kalshi call across all retries, 2000-120000. Exceeding it returns `504 upstream_timeout` |
 | `CACHE_MAX_ENTRIES` | `5000` | Max cached responses, 100-100000. Expired entries drop first, then the oldest |
@@ -74,6 +78,10 @@ limited per key (`RATE_LIMIT_MAX`, default 120).
 
 Rotate a key by changing `API_KEYS` and restarting (or
 redeploying on Railway).
+
+With OAuth on (below), an OAuth access token is accepted
+anywhere an API key is, and it carries the limits and
+portfolio access of the API key it was approved with.
 
 ## REST
 
@@ -194,6 +202,46 @@ listed without credentials or for a key outside
 
 Local stdio is not used. Point the agent at the HTTP URL.
 
+### ChatGPT connector (OAuth)
+
+ChatGPT custom MCP connectors cannot send a static API key,
+so they need OAuth. The server includes a small OAuth 2.1
+authorization server (authorization code with PKCE, plus
+refresh tokens) that is off until you configure it. You
+approve a connection by typing one of your `API_KEYS` on a
+consent page.
+
+1. Generate a secret and add it to the service variables
+   (see Railway below for the exact names):
+   `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+2. Redeploy. The startup log shows
+   `oauth: enabled (issuer https://...)`.
+3. In ChatGPT open Settings, Connectors (OpenAI's docs call
+   this page Plugins; custom MCP servers may need developer
+   mode turned on), and add a custom MCP server with the URL
+   `https://kalshiapi-production.up.railway.app/mcp`.
+4. Choose OAuth as the authentication method. If ChatGPT
+   offers a choice of client registration, either works
+   (Client ID Metadata Document or dynamic registration).
+   The menu names can differ between ChatGPT versions.
+5. ChatGPT opens the consent page. Enter your API key (the
+   key you want ChatGPT to act as) and press Approve.
+
+The access token lasts 1 hour and ChatGPT refreshes it for
+30 days. The connection has the same portfolio access as the
+API key you approved with. Remove that key from `API_KEYS`
+(or change `OAUTH_TOKEN_SECRET`) and every token made with it
+stops working at once. Static API keys keep working for
+Cursor and other clients.
+
+OAuth keeps its replay and revocation state in memory, so the
+service must run as a **single instance**: keep Railway at 1
+replica (see Railway below). A restart forgets that state.
+
+For local testing with MCP Inspector, set
+`PUBLIC_BASE_URL=http://localhost:3000` with a secret and
+point Inspector at `http://localhost:3000/mcp`.
+
 ## Kalshi credentials
 
 Optional. Create a key at kalshi.com (account settings, API
@@ -232,6 +280,16 @@ the health check to `/health`.
    with `base64 -w0 kalshi.pem`.
 4. Generate a public domain. Agents use
    `https://<domain>/v1/...` and `https://<domain>/mcp`.
+5. Keep the service at **1 replica** (`railway.json` pins
+   `numReplicas` to 1). The cache, rate limits,
+   and OAuth replay/revocation state are in memory and are not
+   shared between instances. Do not scale replicas above 1
+   without a shared store.
+6. For the ChatGPT connector add `OAUTH_TOKEN_SECRET` (a
+   random 32+ character value). `PUBLIC_BASE_URL` is
+   optional on Railway because the provided
+   `RAILWAY_PUBLIC_DOMAIN` is used; set it only with a
+   custom domain.
 
 The process binds `0.0.0.0` and trusts one proxy hop.
 

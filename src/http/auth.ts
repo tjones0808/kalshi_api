@@ -30,10 +30,28 @@ const missingAuthMessage =
 const invalidKeyMessage = 'Invalid API key'
 const bearerToken = /^Bearer\s+(\S+)\s*$/i
 
+const invalidTokenMessage = 'Invalid or expired access token'
+
 interface KeyDigest {
 	index: number
 	digest: Buffer
 }
+
+/**
+ * The resource-server half of OAuth, handed to the auth
+ * middleware when OAuth is on.
+ */
+export interface OAuthGate {
+	/** Key index an access token stands for, or `undefined`. */
+	verifyAccessToken: (token: string) => number | undefined
+	/** URL a 401 advertises in `WWW-Authenticate`. */
+	resourceMetadataUrl: string
+	/** Scope a 401 asks the client to request. */
+	scope: string
+}
+
+/** Position of the matching key in `API_KEYS`, or -1. */
+export type KeyMatcher = (token: string) => number
 
 function sha256 (value: string): Buffer {
 	return createHash('sha256')
@@ -115,14 +133,66 @@ function readBearerToken (
 	return token
 }
 
+/**
+ * Match a presented key against every configured key in
+ * constant time. Used by the OAuth consent step, so the API
+ * key check there is the same one `requireApiKey` makes.
+ */
+export function createKeyMatcher (env: AppEnv): KeyMatcher {
+	const digests = digestKeys(env.apiKeys)
+	return function matchKey (token) {
+		return matchKeyIndex(token, digests)
+	}
+}
+
+function bearerChallenge (
+	gate: OAuthGate,
+	hasRejectedToken: boolean,
+): string {
+	const fields: string[] = []
+	if (hasRejectedToken) {
+		fields.push(
+			'error="invalid_token"',
+			`error_description="${invalidTokenMessage}"`,
+		)
+	}
+	fields.push(
+		`resource_metadata="${gate.resourceMetadataUrl}"`,
+		`scope="${gate.scope}"`,
+	)
+	return `Bearer ${fields.join(', ')}`
+}
+
 function sendUnauthorized (
 	res: Response,
 	message: string,
+	gate?: OAuthGate,
+	hasRejectedToken = false,
 ): void {
+	if (gate !== undefined) {
+		res.set(
+			'WWW-Authenticate',
+			bearerChallenge(gate, hasRejectedToken),
+		)
+	}
+	const isTokenError = gate !== undefined && hasRejectedToken
 	res.status(401).json({
-		error: 'unauthorized',
-		message,
+		error: isTokenError ? 'invalid_token' : 'unauthorized',
+		message: isTokenError ? invalidTokenMessage : message,
 	})
+}
+
+/** A static API key, else an OAuth access token; -1 if neither. */
+function resolveKeyIndex (
+	token: string,
+	digests: readonly KeyDigest[],
+	gate: OAuthGate | undefined,
+): number {
+	const keyIndex = matchKeyIndex(token, digests)
+	if (keyIndex >= 0 || gate === undefined) {
+		return keyIndex
+	}
+	return gate.verifyAccessToken(token) ?? -1
 }
 
 /**
@@ -133,8 +203,17 @@ function sendUnauthorized (
  * It is not logged. The raw key is not stored on the
  * request. `req.auth.keyIndex` is the position in
  * `API_KEYS`, and `req.apiKeyId` is `key-0`, `key-1`, ...
+ *
+ * With an `OAuthGate`, a valid OAuth access token is accepted
+ * too and resolves to the key index it was issued for, so
+ * rate limits and portfolio access work the same. Each 401
+ * then carries a `WWW-Authenticate: Bearer` challenge that
+ * points at the protected resource metadata.
  */
-export function requireApiKey (env: AppEnv): RequestHandler {
+export function requireApiKey (
+	env: AppEnv,
+	gate?: OAuthGate,
+): RequestHandler {
 	const digests = digestKeys(env.apiKeys)
 	return function apiKeyMiddleware (
 		req: Request,
@@ -149,12 +228,12 @@ export function requireApiKey (env: AppEnv): RequestHandler {
 			req.get('authorization'),
 		)
 		if (token === undefined) {
-			sendUnauthorized(res, missingAuthMessage)
+			sendUnauthorized(res, missingAuthMessage, gate)
 			return
 		}
-		const keyIndex = matchKeyIndex(token, digests)
+		const keyIndex = resolveKeyIndex(token, digests, gate)
 		if (keyIndex < 0) {
-			sendUnauthorized(res, invalidKeyMessage)
+			sendUnauthorized(res, invalidKeyMessage, gate, true)
 			return
 		}
 		req.auth = { keyIndex }
@@ -188,12 +267,13 @@ function anonRateLimitKey (req: Request): string {
 function hasValidBearer (
 	req: Request,
 	digests: readonly KeyDigest[],
+	gate: OAuthGate | undefined,
 ): boolean {
 	const token = readBearerToken(req.get('authorization'))
 	if (token === undefined) {
 		return false
 	}
-	return matchKeyIndex(token, digests) >= 0
+	return resolveKeyIndex(token, digests, gate) >= 0
 }
 
 function createLimiter (
@@ -222,11 +302,13 @@ function createLimiter (
  * counted, so concurrent or long-lived authenticated calls
  * never use this bucket and an IP that is limited here can
  * still call with a valid key. Health checks are skipped.
- * Mount this before `requireApiKey`. `createApp` sets
- * `trust proxy` to 1.
+ * A valid OAuth access token counts as a valid key when
+ * `gate` is given. Mount this before `requireApiKey`.
+ * `createApp` sets `trust proxy` to 1.
  */
 export function createAnonRateLimit (
 	env: AppEnv,
+	gate?: OAuthGate,
 ): RequestHandler {
 	const digests = digestKeys(env.apiKeys)
 	return createLimiter(
@@ -234,7 +316,8 @@ export function createAnonRateLimit (
 		env.rateLimitAnonMax,
 		anonRateLimitKey,
 		function (req) {
-			return isHealthCheck(req) || hasValidBearer(req, digests)
+			return isHealthCheck(req)
+				|| hasValidBearer(req, digests, gate)
 		},
 	)
 }

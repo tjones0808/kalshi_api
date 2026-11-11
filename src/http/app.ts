@@ -11,6 +11,7 @@ import type { PortfolioService } from '../domain/portfolio-service.js'
 import type { KalshiClient } from '../kalshi/kalshi-client.js'
 import {
 	createAnonRateLimit,
+	createKeyMatcher,
 	createKeyRateLimit,
 	createPortfolioAccess,
 	requireApiKey,
@@ -20,6 +21,11 @@ import {
 	notFoundHandler,
 } from './error-handler.js'
 import { createMcpExpressHandler } from '../mcp/server.js'
+import { createOAuthRouter } from '../oauth/oauth-router.js'
+import {
+	createOAuthService,
+	type OAuthDeps,
+} from '../oauth/oauth-service.js'
 import { createPortfolioRouter } from './routes/portfolio.js'
 import { createV1Router } from './routes/v1.js'
 
@@ -34,6 +40,12 @@ export interface AppServices {
 	 * answers 503 and the MCP portfolio tools are not listed.
 	 */
 	portfolio?: PortfolioService
+}
+
+/** Extras for `createApp`, mainly seams for tests. */
+export interface AppOptions {
+	/** Passed to the OAuth service when OAuth is on. */
+	oauth?: OAuthDeps
 }
 
 function handleHealth (_req: Request, res: Response): void {
@@ -61,6 +73,13 @@ function handleAuthCheck (
  * are parsed last, so only authenticated callers reach the
  * JSON parser.
  *
+ * With `env.oauth` set, the OAuth router is mounted after the
+ * anonymous limiter and before the key check, so its routes
+ * are public and share the per-IP bucket. A valid OAuth
+ * access token then passes the key check and the anonymous
+ * limiter skip like an API key. Without `env.oauth` none of
+ * this exists and behavior is unchanged.
+ *
  * API keys stay inside middleware closures. They are not
  * copied onto `app.locals`.
  *
@@ -75,14 +94,29 @@ function handleAuthCheck (
 export function createApp (
 	env: AppEnv,
 	services?: AppServices,
+	options: AppOptions = {},
 ): Express {
 	const app = express()
 	app.use(helmet())
 	// Railway: trust one proxy hop.
 	app.set('trust proxy', 1)
 	app.get('/health', handleHealth)
-	app.use(createAnonRateLimit(env))
-	app.use(requireApiKey(env))
+	const oauth = env.oauth === null
+		? undefined
+		: createOAuthService(
+			env.oauth,
+			env.apiKeys,
+			createKeyMatcher(env),
+			Date.now,
+			options.oauth ?? {},
+		)
+	app.use(createAnonRateLimit(env, oauth?.gate))
+	if (oauth !== undefined) {
+		app.use(createOAuthRouter(oauth, {
+			windowMs: env.rateLimitWindowMs,
+		}))
+	}
+	app.use(requireApiKey(env, oauth?.gate))
 	app.use(createKeyRateLimit(env))
 	app.use(express.json({ limit: '32kb' }))
 	app.get('/v1/_auth-check', handleAuthCheck)
